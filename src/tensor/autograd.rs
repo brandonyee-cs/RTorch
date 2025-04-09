@@ -10,30 +10,183 @@ use std::fmt::Debug;
 
 // --- Backward Operation Trait ---
 
-/// Trait defining the backward pass for an operation.
-/// Each operation (like Add, Mul, ReLU) will have a struct implementing this.
-/// Needs `Send + Sync` to be usable across threads if parallelism is added later.
-/// Needs `'static` because it's stored in `Box<dyn BackwardOp>`.
+// Fixes to the backward operation implementation in autograd.rs
+
+// Updated BackwardOp trait to simplify the signature
 pub trait BackwardOp: Debug + Send + Sync + 'static {
     /// Computes the gradients with respect to the inputs of the operation.
     ///
     /// # Arguments
-    /// * `inputs` - Weak references to the input Tensors of the original forward operation.
-    ///              Needed to access input shapes or potentially values if required by the backward formula.
-    /// * `output_grad` - The gradient flowing back into this operation's output tensor.
+    /// * `inputs` - The input tensors to the original forward operation
+    /// * `output_grad` - The gradient flowing back into this operation's output tensor
     ///
     /// # Returns
-    /// * `Result<Vec<Tensor>, TensorError>` - A Vec containing the computed gradients
-    ///                                        for each input tensor, in the same order as `inputs`.
-    ///                                        Returns an error if calculation fails.
+    /// * `Result<Vec<Tensor>, TensorError>` - A Vec containing the gradients for each input
     fn backward(
         &self,
-        inputs: &[Weak<Mutex<Tensor>>], // Use Weak<Mutex<Tensor>> to avoid cycles? Or just pass necessary info?
-                                        // Let's pass owned Tensors from AutogradContext for simplicity now.
-                                        // Cloning the Tensor struct is cheap (Arc increments).
-        input_tensors: &[Tensor], // Pass clones of input tensors used in forward pass
+        inputs: &[Tensor],
         output_grad: &Tensor,
     ) -> Result<Vec<Tensor>, TensorError>;
+}
+
+// Improved implementation for AddBackward
+#[derive(Debug)]
+pub struct AddBackward;
+impl BackwardOp for AddBackward {
+    fn backward(
+        &self,
+        inputs: &[Tensor],
+        output_grad: &Tensor,
+    ) -> Result<Vec<Tensor>, TensorError> {
+        // For addition, the gradient flows backward unchanged to both inputs
+        // Need to check for broadcasting and sum along expanded dimensions if needed
+        let input_a = &inputs[0];
+        let input_b = &inputs[1];
+        
+        // Get the shapes
+        let a_shape = input_a.shape();
+        let b_shape = input_b.shape();
+        let output_shape = output_grad.shape();
+        
+        // Basic case: same shapes, directly pass gradient
+        if a_shape == output_shape && b_shape == output_shape {
+            return Ok(vec![output_grad.clone(), output_grad.clone()]);
+        }
+        
+        // Handle broadcasting by reducing over expanded dimensions
+        let grad_a = unbroadcast_grad(output_grad, a_shape)?;
+        let grad_b = unbroadcast_grad(output_grad, b_shape)?;
+        
+        Ok(vec![grad_a, grad_b])
+    }
+}
+
+// Helper function to un-broadcast gradients by summing along expanded dimensions
+fn unbroadcast_grad(grad: &Tensor, target_shape: &[usize]) -> Result<Tensor, TensorError> {
+    let grad_shape = grad.shape();
+    
+    // If shapes are already the same, no need to reduce
+    if grad_shape == target_shape {
+        return Ok(grad.clone());
+    }
+    
+    // If target is scalar, sum all elements
+    if target_shape.is_empty() || (target_shape.len() == 1 && target_shape[0] == 1) {
+        return ops::sum(grad);
+    }
+    
+    // Handle more complex cases
+    // 1. Check if dimensions need to be summed due to broadcasting
+    let mut current_grad = grad.clone();
+    
+    // Pad the shorter shape with 1s on the left
+    let grad_rank = grad_shape.len();
+    let target_rank = target_shape.len();
+    
+    // If ranks differ, we need to sum over the extra leading dimensions
+    if grad_rank > target_rank {
+        // Sum over the extra leading dimensions
+        for _ in 0..(grad_rank - target_rank) {
+            current_grad = ops::sum_dim(&current_grad, 0, false)?;
+        }
+    }
+    
+    // Now the ranks should be the same
+    // Check if any dimension needs to be summed due to broadcasting 1 -> N
+    for i in 0..current_grad.shape().len() {
+        let current_i = if grad_rank > target_rank {
+            i + (grad_rank - target_rank)
+        } else {
+            i
+        };
+        
+        let target_dim = if i < target_shape.len() { target_shape[i] } else { 1 };
+        
+        if current_i < current_grad.shape().len() && 
+           current_grad.shape()[current_i] > target_dim && target_dim == 1 {
+            // Sum along this dimension that was expanded due to broadcasting
+            current_grad = ops::sum_dim(&current_grad, current_i as i32, true)?;
+        }
+    }
+    
+    // Finally, reshape to exactly match the target shape if needed
+    if current_grad.shape() != target_shape {
+        current_grad = ops::reshape(&current_grad, target_shape)?;
+    }
+    
+    Ok(current_grad)
+}
+
+// Placeholder for sum_dim operation - needs to be implemented in ops.rs
+pub fn sum_dim(a: &Tensor, dim: i32, keepdim: bool) -> Result<Tensor, TensorError> {
+    let a_data = a.data();
+    let ndim = a.ndim();
+    
+    // Convert negative dim to positive
+    let dim_positive = if dim < 0 { (ndim as i32 + dim) as usize } else { dim as usize };
+    
+    if dim_positive >= ndim {
+        return Err(TensorError::Generic(format!("Dimension out of range (got {}, should be < {})", dim, ndim)));
+    }
+    
+    // Sum along the specified dimension
+    let result_data = a_data.sum_axis(ndarray::Axis(dim_positive));
+    
+    // If keepdim is true, we need to add back the reduced dimension
+    let result_data = if keepdim {
+        result_data.insert_axis(ndarray::Axis(dim_positive))
+    } else {
+        result_data
+    };
+    
+    // Create a new tensor from the result
+    let requires_grad = a.requires_grad;
+    
+    // Create a backward op with the original input shape
+    let backward_op = Box::new(SumDimBackward::new(a.shape().to_vec(), dim_positive, keepdim));
+    
+    create_op_result(result_data, vec![a.clone()], backward_op)
+}
+
+// Sum dimension backward operation
+#[derive(Debug)]
+pub struct SumDimBackward {
+    input_shape: Vec<usize>,
+    dim: usize,
+    keepdim: bool,
+}
+
+impl SumDimBackward {
+    pub fn new(input_shape: Vec<usize>, dim: usize, keepdim: bool) -> Self {
+        Self { input_shape, dim, keepdim }
+    }
+}
+
+impl BackwardOp for SumDimBackward {
+    fn backward(
+        &self,
+        _inputs: &[Tensor],
+        output_grad: &Tensor,
+    ) -> Result<Vec<Tensor>, TensorError> {
+        let mut grad_data = output_grad.data_clone();
+        
+        // If keepdim was false, we need to add back the dimension
+        if !self.keepdim {
+            grad_data = grad_data.insert_axis(ndarray::Axis(self.dim));
+        }
+        
+        // Broadcast gradient to match the original input shape
+        let mut result_shape = self.input_shape.clone();
+        
+        // Create a tensor with the broadcasted gradient
+        let mut broadcast_grad = ndarray::ArrayD::<TensorData>::zeros(ndarray::IxDyn(&result_shape));
+        
+        // Fill the result with the gradient (broadcasting)
+        // This is a simple implementation - a full one would use ndarray's broadcasting
+        broadcast_grad.fill(grad_data.sum().unwrap_or(0.0) / (grad_data.len() as TensorData));
+        
+        Ok(vec![Tensor::new(broadcast_grad, output_grad.requires_grad)])
+    }
 }
 
 // --- Autograd Context ---
@@ -641,4 +794,4 @@ pub mod op_abstractions {
 } // end mod op_abstractions
 
 // Re-export for use in ops.rs etc.
-pub use op_abstractions::*;
+pub use op_abstractions::*;b

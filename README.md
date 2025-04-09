@@ -252,8 +252,6 @@ Contributions are welcome, but please keep the experimental nature of the projec
 
 This project is licensed under the MIT License.
 
-at your option.
-
 ## Acknowledgements
 
 This project is heavily inspired by [PyTorch](https://pytorch.org/) and aims to replicate parts of its API and functionality. It relies on fantastic Rust crates like `ndarray`, `PyO3`, `serde`, `rayon`, and `rand`.

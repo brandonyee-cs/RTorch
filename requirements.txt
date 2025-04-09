@@ -1,0 +1,5 @@
+numpy>=1.16.0       # Required for tensor interoperability
+setuptools>=18.0    # For building the extension
+setuptools-rust>=0.10.2  # For Python-Rust integration
+wheel>=0.36.2       # For building wheel packages
+pytest>=6.0.0       # For running tests
